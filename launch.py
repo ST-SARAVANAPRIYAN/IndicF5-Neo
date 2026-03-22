@@ -24,6 +24,7 @@ from src.config import get_config
 from src.utils.logger import LoggerSetup, get_logger
 from src.utils.device_manager import DeviceManager
 from src.inference.engine import get_inference_engine
+from src.inference.subtitles import SubtitleGenerator
 from src.data_management.profile_manager import VoiceProfileManager
 
 # Setup logging
@@ -39,6 +40,7 @@ inference_engine = get_inference_engine()
 # Output directory
 output_dir = config.paths.outputs_dir / "history"
 output_dir.mkdir(parents=True, exist_ok=True)
+subtitle_generator = SubtitleGenerator(output_dir=output_dir)
 
 logger.info("=" * 50)
 logger.info("IndicF5 Neo - Text-to-Speech Application")
@@ -96,6 +98,8 @@ def synthesize(
     ref_audio,
     ref_text,
     gen_text,
+    subtitle_lang,
+    generate_srt,
     remove_silence,
     min_silence_duration_ms,
     silence_threshold_db,
@@ -170,6 +174,19 @@ def synthesize(
         sf.write(str(output_path), audio, sr)
         logger.info(f"Audio saved to {output_path}")
 
+        srt_file = None
+        srt_method = "disabled"
+        if generate_srt:
+            try:
+                srt_file, srt_method = subtitle_generator.generate_srt(
+                    audio_path=output_path,
+                    transcript=gen_text,
+                    language=subtitle_lang,
+                )
+                logger.info("SRT saved to %s", srt_file)
+            except Exception as e:
+                logger.warning("SRT generation failed: %s", str(e))
+
         request_elapsed = time.time() - req_start
         status = (
             f"✓ Generated on {metrics.get('device', device_type)} | "
@@ -178,8 +195,10 @@ def synthesize(
             f"rtf {metrics.get('rtf', 0.0):.2f} | "
             f"req {request_elapsed:.2f}s"
         )
+        if generate_srt:
+            status += f" | srt {srt_method}"
         logger.info("[REQ] completed in %.2fs", request_elapsed)
-        return (sr, audio), status, get_history_files()
+        return (sr, audio), status, get_history_files(), srt_file
         
     except gr.Error:
         raise
@@ -749,7 +768,18 @@ with gr.Blocks(
                             label="Remove Long Gaps",
                             value=False
                         )
+                        generate_srt_chk = gr.Checkbox(
+                            label="Generate SRT",
+                            value=True,
+                        )
                         offload_btn = gr.Button("♻️ Offload", scale=1)
+
+                    subtitle_lang = gr.Dropdown(
+                        choices=["ta", "hi", "te", "kn", "ml", "bn"],
+                        value="ta",
+                        label="Subtitle Language",
+                        info="Used for forced alignment model selection",
+                    )
 
                     with gr.Row(visible=False) as gap_removal_row:
                         min_silence_slider = gr.Slider(
@@ -793,6 +823,8 @@ with gr.Blocks(
             with gr.Row():
                 audio_out = gr.Audio(label="Generated Audio", type="numpy")
                 status_out = gr.Textbox(label="Status", interactive=False)
+            with gr.Row():
+                srt_out = gr.File(label="Generated Subtitles (.srt)")
         
         
         # ============ PROFILES TAB ============
@@ -907,6 +939,8 @@ with gr.Blocks(
             ref_audio_in,
             ref_text_in,
             gen_text_in,
+            subtitle_lang,
+            generate_srt_chk,
             remove_silence_chk,
             min_silence_slider,
             threshold_slider,
@@ -915,7 +949,7 @@ with gr.Blocks(
             cfg_strength_slider,
             device_radio,
         ],
-        outputs=[audio_out, status_out, history_table],
+        outputs=[audio_out, status_out, history_table, srt_out],
         queue=True,
     )
 
@@ -1134,7 +1168,10 @@ def main():
             share=config.ui.share,
             debug=config.ui.debug,
             inbrowser=True,
-            allowed_paths=[str(config.paths.profiles_dir.resolve())],
+            allowed_paths=[
+                str(config.paths.profiles_dir.resolve()),
+                str(config.paths.outputs_dir.resolve()),
+            ],
             theme=gr.themes.Soft(),
             max_threads=server_max_threads,
             css="""

@@ -36,3 +36,4 @@ python-dotenv
 torchcodec
 psutil
 threadpoolctl
+ctc-segmentation
