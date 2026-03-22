@@ -6,7 +6,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import soundfile as sf
@@ -37,6 +37,10 @@ class SubtitleGenerator:
         "bn": "arijitx/wav2vec2-xls-r-300m-bengali",
     }
     DEFAULT_MULTILINGUAL_MODEL = "facebook/wav2vec2-xls-r-300m"
+    MIN_SEGMENT_DURATION_SEC = 0.20
+    MIN_GAP_DEFAULT_SEC = 0.04
+    MIN_GAP_PUNCT_SEC = 0.10
+    SNAP_WINDOW_SEC = 0.20
 
     def __init__(self, output_dir: Path):
         self.output_dir = Path(output_dir)
@@ -74,6 +78,7 @@ class SubtitleGenerator:
             logger.warning("CTC alignment unavailable, using estimated timing: %s", str(e))
             segments = self._estimate_segments(audio_path=audio_path, transcript=text)
 
+        segments = self._refine_segments_with_silence(audio_path=audio_path, segments=segments)
         self._write_srt(segments=segments, srt_path=srt_path)
         return str(srt_path), method
 
@@ -136,12 +141,10 @@ class SubtitleGenerator:
         )
 
         aligned_words: List[SubtitleSegment] = []
-        prev_end = 0.0
         for entry in word_segments:
             text = str(entry[0]).strip()
-            start = max(float(entry[1]), prev_end)
+            start = max(float(entry[1]), 0.0)
             end = max(float(entry[2]), start + 0.04)
-            prev_end = end
             if text:
                 aligned_words.append(SubtitleSegment(start=start, end=end, text=text))
 
@@ -237,6 +240,135 @@ class SubtitleGenerator:
         if segments:
             segments[-1].end = duration
         return segments
+
+    def _refine_segments_with_silence(
+        self,
+        audio_path: Path,
+        segments: List[SubtitleSegment],
+    ) -> List[SubtitleSegment]:
+        if not segments:
+            return segments
+
+        silences = self._detect_silence_ranges(audio_path)
+        refined: List[SubtitleSegment] = []
+        for seg in segments:
+            start = max(seg.start, 0.0)
+            end = max(seg.end, start + self.MIN_SEGMENT_DURATION_SEC)
+
+            snapped_start = self._snap_to_nearest_boundary(
+                value=start,
+                boundaries=[s_end for _, s_end in silences],
+                window=self.SNAP_WINDOW_SEC,
+            )
+            if snapped_start is not None and snapped_start < end - self.MIN_SEGMENT_DURATION_SEC:
+                start = max(0.0, snapped_start)
+
+            snapped_end = self._snap_to_nearest_boundary(
+                value=end,
+                boundaries=[s_start for s_start, _ in silences],
+                window=self.SNAP_WINDOW_SEC,
+            )
+            if snapped_end is not None and snapped_end > start + self.MIN_SEGMENT_DURATION_SEC:
+                end = snapped_end
+
+            refined.append(SubtitleSegment(start=start, end=end, text=seg.text))
+
+        return self._enforce_timing_consistency(refined, silences)
+
+    def _detect_silence_ranges(self, audio_path: Path) -> List[Tuple[float, float]]:
+        try:
+            from pydub import AudioSegment, silence
+
+            audio_seg = AudioSegment.from_file(str(audio_path))
+            if audio_seg.duration_seconds <= 0:
+                return []
+
+            base_dbfs = -35.0 if audio_seg.dBFS == float("-inf") else float(audio_seg.dBFS)
+            silence_thresh = min(-28.0, base_dbfs - 10.0)
+            silence_ranges_ms = silence.detect_silence(
+                audio_seg,
+                min_silence_len=120,
+                silence_thresh=silence_thresh,
+                seek_step=5,
+            )
+            return [(start_ms / 1000.0, end_ms / 1000.0) for start_ms, end_ms in silence_ranges_ms]
+        except Exception as e:
+            logger.debug("Silence detection skipped: %s", str(e))
+            return []
+
+    def _snap_to_nearest_boundary(
+        self,
+        value: float,
+        boundaries: List[float],
+        window: float,
+    ) -> Optional[float]:
+        if not boundaries:
+            return None
+        best = None
+        best_dist = float("inf")
+        for boundary in boundaries:
+            dist = abs(boundary - value)
+            if dist <= window and dist < best_dist:
+                best = boundary
+                best_dist = dist
+        return best
+
+    def _enforce_timing_consistency(
+        self,
+        segments: List[SubtitleSegment],
+        silences: List[Tuple[float, float]],
+    ) -> List[SubtitleSegment]:
+        if not segments:
+            return []
+
+        normalized: List[SubtitleSegment] = []
+        for seg in segments:
+            start = max(seg.start, 0.0)
+            end = max(seg.end, start + self.MIN_SEGMENT_DURATION_SEC)
+
+            if normalized:
+                prev = normalized[-1]
+                min_gap = (
+                    self.MIN_GAP_PUNCT_SEC
+                    if re.search(r"[.!?।,:;]$", prev.text.strip())
+                    else self.MIN_GAP_DEFAULT_SEC
+                )
+                required_start = prev.end + min_gap
+
+                if start < required_start:
+                    start = required_start
+
+                bridge_silence = self._find_bridge_silence(
+                    prev_end=prev.end,
+                    next_start=start,
+                    silences=silences,
+                )
+                if bridge_silence is not None:
+                    s_start, s_end = bridge_silence
+                    if s_start > prev.start + self.MIN_SEGMENT_DURATION_SEC:
+                        prev.end = max(prev.end, s_start)
+                    start = max(start, s_end)
+
+                if start >= end - 0.04:
+                    start = max(prev.end + self.MIN_GAP_DEFAULT_SEC, end - self.MIN_SEGMENT_DURATION_SEC)
+
+                if start < prev.end:
+                    start = prev.end
+
+            normalized.append(SubtitleSegment(start=start, end=end, text=seg.text))
+
+        return normalized
+
+    def _find_bridge_silence(
+        self,
+        prev_end: float,
+        next_start: float,
+        silences: List[Tuple[float, float]],
+    ) -> Optional[Tuple[float, float]]:
+        for s_start, s_end in silences:
+            if s_start <= next_start and s_end >= prev_end and (s_end - s_start) >= self.MIN_GAP_DEFAULT_SEC:
+                return (s_start, s_end)
+        return None
 
     def _write_srt(self, segments: List[SubtitleSegment], srt_path: Path) -> None:
         lines: List[str] = []
