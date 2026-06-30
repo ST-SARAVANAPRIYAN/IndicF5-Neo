@@ -527,15 +527,59 @@ def infer_batch_process(
 
 
 def remove_silence_for_generated_wav(filename):
-    aseg = AudioSegment.from_file(filename)
-    non_silent_segs = silence.split_on_silence(
-        aseg, min_silence_len=1000, silence_thresh=-50, keep_silence=500, seek_step=10
-    )
-    non_silent_wave = AudioSegment.silent(duration=0)
-    for non_silent_seg in non_silent_segs:
-        non_silent_wave += non_silent_seg
-    aseg = non_silent_wave
-    aseg.export(filename, format="wav")
+    # Faster silence trimming using torchaudio + numpy RMS windowing instead of pydub.split_on_silence
+    try:
+        waveform, sr = torchaudio.load(filename)
+    except Exception:
+        # Fallback to pydub behaviour if torchaudio can't read the file
+        aseg = AudioSegment.from_file(filename)
+        non_silent_segs = silence.split_on_silence(
+            aseg, min_silence_len=1000, silence_thresh=-50, keep_silence=500, seek_step=10
+        )
+        non_silent_wave = AudioSegment.silent(duration=0)
+        for non_silent_seg in non_silent_segs:
+            non_silent_wave += non_silent_seg
+        aseg = non_silent_wave
+        aseg.export(filename, format="wav")
+        return
+
+    # Convert to mono
+    if waveform.dim() > 1:
+        mono = waveform.mean(dim=0).cpu().numpy()
+    else:
+        mono = waveform.cpu().numpy()
+
+    # Parameters (tunable)
+    chunk_ms = 10
+    silence_thresh_db = -50.0
+
+    frame_len = max(1, int(sr * chunk_ms / 1000))
+
+    # compute RMS per frame
+    padded = np.concatenate([mono, np.zeros(frame_len)])
+    sq = padded * padded
+    window = np.ones(frame_len, dtype=float) / frame_len
+    rms = np.sqrt(np.convolve(sq, window, mode="valid"))
+    db = 20.0 * np.log10(rms + 1e-9)
+
+    non_silent = db > silence_thresh_db
+    if not np.any(non_silent):
+        # nothing detected as non-silent; keep original
+        return
+
+    start_frame = int(np.argmax(non_silent))
+    end_frame = int(len(non_silent) - np.argmax(non_silent[::-1]))
+
+    start_sample = max(0, start_frame * frame_len)
+    end_sample = min(len(mono), (end_frame + 1) * frame_len)
+
+    trimmed = mono[start_sample:end_sample]
+
+    # save back using torchaudio
+    trimmed_tensor = torch.from_numpy(np.asarray(trimmed, dtype=np.float32))
+    if trimmed_tensor.dim() == 1:
+        trimmed_tensor = trimmed_tensor.unsqueeze(0)
+    torchaudio.save(filename, trimmed_tensor, sr)
 
 
 # save spectrogram

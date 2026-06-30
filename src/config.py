@@ -1,5 +1,6 @@
 """Configuration management for IndicF5 Neo"""
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -32,17 +33,23 @@ class InferenceConfig:
 @dataclass
 class ModelConfig:
     """Model loading configuration"""
-    model_repo: str = "ai4bharat/IndicF5"
-    vocoder_repo: str = "charactr/vocos-mel-24khz"
+    model_repo: str = os.getenv("INDICF5_MODEL_PATH", "ai4bharat/IndicF5")
+    vocoder_repo: str = os.getenv("INDICF5_VOCODER_PATH", "charactr/vocos-mel-24khz")
     device: str = "auto"  # auto, cuda, cpu
     dtype: str = "float32"  # float32, float16
     use_mixed_precision: bool = True
-    torch_compile: bool = True
+    torch_compile: bool = False
     compile_mode: str = "reduce-overhead"
     enable_tf32: bool = True
     cudnn_benchmark: bool = True
-    warmup_on_load: bool = True
+    warmup_on_load: bool = False
     enable_cache: bool = True
+    
+    def __post_init__(self):
+        """Check if local model exists and use it if so"""
+        local_model = Path("models/IndicF5")
+        if local_model.exists() and any(local_model.iterdir()) and self.model_repo == "ai4bharat/IndicF5":
+            self.model_repo = str(local_model.absolute())
     
     def get_device(self) -> str:
         """Get appropriate device"""

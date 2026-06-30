@@ -41,6 +41,7 @@ class SubtitleGenerator:
     MIN_GAP_DEFAULT_SEC = 0.04
     MIN_GAP_PUNCT_SEC = 0.10
     SNAP_WINDOW_SEC = 0.20
+    MAX_BOUNDARY_SHIFT_SEC = 0.18
 
     def __init__(self, output_dir: Path):
         self.output_dir = Path(output_dir)
@@ -251,9 +252,11 @@ class SubtitleGenerator:
 
         silences = self._detect_silence_ranges(audio_path)
         refined: List[SubtitleSegment] = []
+        original: List[SubtitleSegment] = []
         for seg in segments:
             start = max(seg.start, 0.0)
             end = max(seg.end, start + self.MIN_SEGMENT_DURATION_SEC)
+            original.append(SubtitleSegment(start=start, end=end, text=seg.text))
 
             snapped_start = self._snap_to_nearest_boundary(
                 value=start,
@@ -273,7 +276,7 @@ class SubtitleGenerator:
 
             refined.append(SubtitleSegment(start=start, end=end, text=seg.text))
 
-        return self._enforce_timing_consistency(refined, silences)
+        return self._enforce_timing_consistency(refined, silences, original)
 
     def _detect_silence_ranges(self, audio_path: Path) -> List[Tuple[float, float]]:
         try:
@@ -317,47 +320,81 @@ class SubtitleGenerator:
         self,
         segments: List[SubtitleSegment],
         silences: List[Tuple[float, float]],
+        original_segments: List[SubtitleSegment],
     ) -> List[SubtitleSegment]:
         if not segments:
             return []
 
-        normalized: List[SubtitleSegment] = []
-        for seg in segments:
-            start = max(seg.start, 0.0)
-            end = max(seg.end, start + self.MIN_SEGMENT_DURATION_SEC)
+        normalized = [
+            SubtitleSegment(
+                start=max(seg.start, 0.0),
+                end=max(seg.end, max(seg.start, 0.0) + self.MIN_SEGMENT_DURATION_SEC),
+                text=seg.text,
+            )
+            for seg in segments
+        ]
 
-            if normalized:
-                prev = normalized[-1]
-                min_gap = (
-                    self.MIN_GAP_PUNCT_SEC
-                    if re.search(r"[.!?।,:;]$", prev.text.strip())
-                    else self.MIN_GAP_DEFAULT_SEC
-                )
-                required_start = prev.end + min_gap
+        for idx in range(1, len(normalized)):
+            prev = normalized[idx - 1]
+            cur = normalized[idx]
+            prev_ref = original_segments[idx - 1]
+            cur_ref = original_segments[idx]
 
-                if start < required_start:
-                    start = required_start
+            min_gap = (
+                self.MIN_GAP_PUNCT_SEC
+                if re.search(r"[.!?।,:;]$", prev.text.strip())
+                else self.MIN_GAP_DEFAULT_SEC
+            )
 
-                bridge_silence = self._find_bridge_silence(
-                    prev_end=prev.end,
-                    next_start=start,
-                    silences=silences,
-                )
-                if bridge_silence is not None:
-                    s_start, s_end = bridge_silence
-                    if s_start > prev.start + self.MIN_SEGMENT_DURATION_SEC:
-                        prev.end = max(prev.end, s_start)
-                    start = max(start, s_end)
+            bridge_silence = self._find_bridge_silence(
+                prev_end=prev.end,
+                next_start=cur.start,
+                silences=silences,
+            )
+            if bridge_silence is not None:
+                s_start, s_end = bridge_silence
+                new_prev_end = self._clamp_shift(prev.end, s_start, prev_ref.end)
+                if new_prev_end > prev.start + self.MIN_SEGMENT_DURATION_SEC:
+                    prev.end = new_prev_end
 
-                if start >= end - 0.04:
-                    start = max(prev.end + self.MIN_GAP_DEFAULT_SEC, end - self.MIN_SEGMENT_DURATION_SEC)
+                new_cur_start = self._clamp_shift(cur.start, s_end, cur_ref.start)
+                if new_cur_start < cur.end - self.MIN_SEGMENT_DURATION_SEC:
+                    cur.start = new_cur_start
 
-                if start < prev.end:
-                    start = prev.end
+            gap = cur.start - prev.end
+            if gap >= min_gap:
+                continue
 
-            normalized.append(SubtitleSegment(start=start, end=end, text=seg.text))
+            needed = min_gap - gap
+            prev_shrink_cap = max(0.0, prev.end - (prev.start + self.MIN_SEGMENT_DURATION_SEC))
+            cur_expand_cap = max(0.0, (cur.end - self.MIN_SEGMENT_DURATION_SEC) - cur.start)
+
+            move_prev = min(needed * 0.5, prev_shrink_cap, self.MAX_BOUNDARY_SHIFT_SEC)
+            prev.end -= move_prev
+            needed -= move_prev
+
+            if needed > 0:
+                move_cur = min(needed, cur_expand_cap, self.MAX_BOUNDARY_SHIFT_SEC)
+                cur.start += move_cur
+
+            if cur.start < prev.end:
+                boundary = (prev.end + cur.start) / 2.0
+                prev.end = max(prev.start + self.MIN_SEGMENT_DURATION_SEC, boundary - self.MIN_GAP_DEFAULT_SEC / 2.0)
+                cur.start = min(cur.end - self.MIN_SEGMENT_DURATION_SEC, boundary + self.MIN_GAP_DEFAULT_SEC / 2.0)
+
+        for idx, seg in enumerate(normalized):
+            seg.start = max(seg.start, 0.0)
+            seg.end = max(seg.end, seg.start + self.MIN_SEGMENT_DURATION_SEC)
+            ref = original_segments[idx]
+            seg.start = self._clamp_shift(seg.start, seg.start, ref.start)
+            seg.end = self._clamp_shift(seg.end, seg.end, ref.end)
 
         return normalized
+
+    def _clamp_shift(self, current: float, candidate: float, reference: float) -> float:
+        lower = reference - self.MAX_BOUNDARY_SHIFT_SEC
+        upper = reference + self.MAX_BOUNDARY_SHIFT_SEC
+        return min(max(candidate, lower), upper)
 
     def _find_bridge_silence(
         self,

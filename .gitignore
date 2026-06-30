@@ -183,3 +183,6 @@ profiles/
 outputs/
 logs/
 .cache/
+
+# Models
+models/
